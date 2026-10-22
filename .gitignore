@@ -1,0 +1,90 @@
+# ---------- Java / Maven build output ----------
+target/
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+hs_err_pid*
+replay_pid*
+
+# ---------- Maven wrapper (keep the scripts, ignore downloaded binaries) ----------
+.mvn/wrapper/maven-wrapper.properties
+
+# ---------- Spring Boot ----------
+spring-boot-*.log
+*.log
+logs/
+
+# ---------- IDEs ----------
+# IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Eclipse
+.classpath
+.project
+.settings/
+.factorypath
+.springBeans
+.sts4-cache/
+bin/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# NetBeans
+nbproject/private/
+nbbuild/
+nbdist/
+.nb-gradle/
+
+# ---------- OS junk ----------
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.fuse_hidden*
+.Trash-*
+
+# ---------- Test / coverage reports ----------
+surefire-reports/
+failsafe-reports/
+jacoco.exec
+*.coverage
+*.coveragexml
+coverage/
+
+# ---------- Local environment overrides ----------
+application-local.yml
+application-local.properties
+.env
+.env.*
+!.env.example
+
+# ---------- Temp files ----------
+*.tmp
+*.swp
+*.swo
+*~.nib
+
+# ---------- Docker ----------
+docker-compose.override.yml
+docker-compose.*.local.yml
