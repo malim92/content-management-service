@@ -1,37 +1,42 @@
 # Content Management Service
 
-A small Spring Boot CMS service for managing and retrieving website content.
-Focus: API design, clean code, PostgreSQL, Redis caching, concurrency safety,
-and high-performance data access.
+A small Spring Boot service for managing website content (CMS).
+Built with Java 21, Spring Boot, PostgreSQL and Redis.
 
-- **Java 21**, Spring Boot 3.3, Maven
-- **PostgreSQL** (via JPA/Hibernate + Flyway migrations)
-- **Redis** (cache-aside with graceful degradation)
-- **JUnit 5** unit, web-layer and Testcontainers integration tests
+## Setup and run
 
-## Quick start
+You need Docker. Then just run:
 
 ```bash
-# Option A: full stack with Docker
 docker compose up --build
+```
 
-# Option B: local run (needs PostgreSQL on 5432 and Redis on 6379)
+This starts PostgreSQL, Redis and the app. Once everything is up the API
+is on `http://localhost:8080`. Stop with `Ctrl+C` (or `docker compose down`).
+
+For local development you can also run the app directly against the
+database and redis containers:
+
+```bash
+docker compose up -d postgres redis
 mvn spring-boot:run
 ```
 
-The service starts on `http://localhost:8080`.
+Config is done through environment variables (see `application.yml` for the
+defaults): `DB_URL`, `DB_USERNAME`, `DB_PASSWORD`, `REDIS_HOST`,
+`REDIS_PORT`, `SERVER_PORT`.
 
 ## API
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST   | `/api/v1/cms/contents` | Create content (201) |
-| GET    | `/api/v1/cms/contents/{id}` | Get content by id (Redis-cached) |
-| PUT    | `/api/v1/cms/contents/{id}` | Update content (optimistic locking) |
-| DELETE | `/api/v1/cms/contents/{id}` | Delete content (204) |
-| GET    | `/api/v1/cms/contents` | Search: `language`, `status`, `key` (prefix), `page`, `size` |
+| POST   | `/api/v1/cms/contents` | Create content (returns 201) |
+| GET    | `/api/v1/cms/contents/{id}` | Get one content (served from cache) |
+| PUT    | `/api/v1/cms/contents/{id}` | Update content (needs `expectedVersion`) |
+| DELETE | `/api/v1/cms/contents/{id}` | Delete content (returns 204) |
+| GET    | `/api/v1/cms/contents` | Search by `language`, `status`, `key`, with `page` and `size` |
 
-Example content:
+Example request body:
 
 ```json
 {
@@ -45,141 +50,150 @@ Example content:
 
 Search example: `GET /api/v1/cms/contents?language=en&status=PUBLISHED&page=0&size=20`
 
-Every success response uses a consistent envelope:
+All success responses look like this:
 
 ```json
 { "success": true, "message": "OK", "data": { ... }, "timestamp": "..." }
 ```
 
-Every error uses a consistent envelope:
+And all errors like this:
 
 ```json
-{ "success": false, "code": "CONTENT_NOT_FOUND", "message": "...", "details": [], "path": "...", "timestamp": "..." }
+{ "success": false, "code": "CONTENT_NOT_FOUND", "message": "...",
+  "details": [], "path": "...", "timestamp": "..." }
 ```
 
-## Design decisions
+Error codes: 404 `CONTENT_NOT_FOUND`, 409 `DUPLICATE_CONTENT_KEY`,
+409 `CONCURRENT_UPDATE`, 400 `INVALID_REQUEST` (with field details),
+500 `DATABASE_ERROR` / `INTERNAL_ERROR`.
 
-### Redis caching strategy
+Quick smoke test:
 
-Cache-aside (lazy population) for the read-by-id path, implemented in
-`ContentCache` / `ContentService`:
+```bash
+curl -X POST http://localhost:8080/api/v1/cms/contents \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"homepage.banner","title":"Welcome","content":"Welcome to our website","language":"en","status":"PUBLISHED"}'
 
+curl http://localhost:8080/api/v1/cms/contents/1
+curl "http://localhost:8080/api/v1/cms/contents?language=en&status=PUBLISHED&page=0&size=20"
+
+curl -X PUT http://localhost:8080/api/v1/cms/contents/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"New title","content":"New body","status":"PUBLISHED","expectedVersion":0}'
+
+curl -X DELETE http://localhost:8080/api/v1/cms/contents/1
 ```
-Request -> Redis --hit--> return content
-                \--miss--> PostgreSQL -> write back to Redis -> Response
-```
 
-- Values are stored as JSON (`ContentResponse`) with a **10-minute TTL plus
-  ±20% random jitter** to avoid a load of simultaneous expirations.
-- TTL is only a safety net: every write explicitly invalidates the affected
-  entry, so the cache is normally consistent within a single request of the
-  database state.
-- The search/list endpoint is **not** cached. Search traffic is diverse and
-  paginated, so each page is a single cheap indexed query; caching page results
-  would add cross-entry invalidation complexity for little gain.
+## How it works
+
+### Redis caching
+
+Reads by id go through a simple cache-aside flow: check Redis first,
+and only hit the database when the key is not there. On a miss the result
+is written back to Redis so the next read is a hit.
+
+Cached entries live for 10 minutes. I added a random jitter of up to 20%
+on top of that so entries don't all expire at the same time and stampede
+the database. The TTL is just a backup though - the real consistency comes
+from invalidation on every write (see below).
+
+The search endpoint is not cached on purpose. Searches vary a lot and each
+page is already a fast indexed query, so caching page results would cause
+more problems than it solves.
 
 ### Cache invalidation
 
-Write operations follow **database-first, then invalidate**:
-
-1. Commit the change to PostgreSQL inside the transaction.
-2. After the commit, delete the Redis entry (`cache.evict`).
-
-Invalidation (delete, not update) is used because it is simpler and race-safe:
-a concurrent reader that re-populates the cache between the commit and the
-evict will simply populate with the now-current value. Creates *warm* the
-cache with the freshly persisted value.
+Writes go to the database first, and only then the Redis entry is deleted.
+I delete instead of update because it's simpler and handles races well -
+if a reader re-populates the cache a moment before the delete, they just
+cache the new value. Creating content also puts it straight into the cache,
+so a freshly created item is a cache hit on its very first read.
 
 ### Database indexing
 
-Owned by Flyway migration `V1__init_schema.sql`:
+The schema is in `src/main/resources/db/migration/V1__init_schema.sql`
+(managed by Flyway, Hibernate only validates it).
 
-- Primary key: identity `id`.
-- **Unique constraint** on `(content_key, language)` — the same logical key
-  may exist once per language; this also enforces duplicate-key detection at
-  the database level (the application pre-check plus this constraint closes
-  the check-then-insert race).
-- Indexes on `status`, `language`, and `created_at` (the default search sort).
-- `version` column for optimistic locking; status restricted by a CHECK
-  constraint.
+- `id` is the primary key (auto-increment)
+- unique constraint on `(content_key, language)` so the same key can only
+  exist once per language. The app checks for duplicates before inserting to
+  return a nice 409, but this constraint is what actually guarantees it -
+  it even covers the case where two requests insert at the exact same time
+- indexes on `status`, `language` and `created_at` (the search sort order)
 
-### Concurrent update handling
+### Concurrent updates
 
-**Optimistic locking with the `@Version` column:**
+The entity has a `version` column with optimistic locking. Every response
+includes the current version, and a PUT must send it back as
+`expectedVersion`. If it doesn't match, someone else saved a change in
+between and the update is rejected with 409 `CONCURRENT_UPDATE`. The client
+just needs to fetch the content again and retry.
 
-- Every response includes `version`.
-- `PUT` requires `expectedVersion` — the version the client last saw.
-- If it no longer matches (another admin committed a change first), the update
-  is rejected with **409 `CONCURRENT_UPDATE`** and the client is told to
-  refresh and retry. One administrator can never silently overwrite another's
-  changes; the last writer does **not** win automatically.
-- The service compares versions before flushing and also converts
-  `OptimisticLockException` (lost race between read and write) into 409.
+So if two admins edit the same content at the same time, one write wins and
+the other gets a clear error instead of silently overwriting the first change.
 
-### Redis failure handling
+### Redis failures
 
-All Redis operations in `ContentCache` are wrapped: on any Redis exception the
-cache degrades to "miss" (reads fall through to PostgreSQL, writes are skipped)
-and the request continues normally — the application keeps working safely in
-database-only mode while Redis is down, and picks the cache back up
-automatically when it recovers. Redis failures are logged as warnings, never
-propagated to clients.
+If Redis goes down, the app keeps working. Every cache call is wrapped, so
+on a Redis error the read just falls through to the database and the write
+is skipped. Requests are never failed because of Redis; you just lose the
+caching benefit until it comes back. There is a warning in the logs when
+this happens.
 
-### Performance considerations (10k+ reads/minute)
+### Performance
 
-- **Redis cache-aside** absorbs the read load: cached reads cost no database
-  connection at all.
-- **HikariCP pool** sized moderately (20) — cached traffic doesn't consume
-  connections; pool-too-large hurts, not helps.
-- **Single-query search** via JPA Specifications with pagination (`page`/`size`,
-  size capped at 100) instead of in-memory filtering.
-- **Indexes** on all filter/sort columns; unique index doubles as the
-  duplicate-key guard.
-- **`open-in-view: false`** so no lazy-loading surprises or extra queries
-  outside transactions.
-- **Lean JSON payloads**: cached values are stored already-serialized DTOs, so
-  cache hits skip entity mapping entirely.
-- Flyway-owned schema (`ddl-auto: validate`) keeps startup predictable.
+- cached reads never touch the database, so they don't use connections either
+- HikariCP pool is 20 connections - more wouldn't help since reads mostly
+  come from cache
+- search runs as a single SQL query with pagination, no in-memory filtering
+- `open-in-view` is off so nothing lazy-loads outside transactions
+- cache hits skip entity mapping, the cached value is already the response DTO
 
-## Error handling
+## Testing
 
-| Scenario | HTTP | Code |
-|----------|------|------|
-| Content not found | 404 | `CONTENT_NOT_FOUND` |
-| Duplicate (key, language) | 409 | `DUPLICATE_CONTENT_KEY` |
-| Stale `expectedVersion` | 409 | `CONCURRENT_UPDATE` |
-| Bean validation failure (blank fields, bad language tag) | 400 | `INVALID_REQUEST` (with field details) |
-| Invalid enum value (e.g. `status=UNKNOWN`) | 400 | `INVALID_REQUEST` |
-| Database error | 500 | `DATABASE_ERROR` |
-| Redis unavailable | *(none — degraded to database-only)* | |
-| Anything unexpected | 500 | `INTERNAL_ERROR` |
-
-## Tests
+### Unit and integration tests
 
 ```bash
 mvn test
 ```
 
-- `ContentServiceTest` — unit tests for create/get/update/delete, cache hit and
-  miss, invalidation on write, duplicate key (including the constraint race),
-  concurrent update, pagination.
-- `ContentCacheTest` — cache get/put/evict and Redis-unavailable degradation.
-- `ContentControllerTest` — web-layer tests for all HTTP statuses and the
-  consistent error envelope.
-- `ContentApiIntegrationTest` — full end-to-end tests against real PostgreSQL
-  and Redis (Testcontainers), covering the full lifecycle including cache
-  invalidation and optimistic locking. Automatically skipped when Docker is
-  unavailable (`@Testcontainers(disabledWithoutDocker = true)`), so unit test
-  runs never fail for lack of Docker.
+- `ContentServiceTest` - create/get/update/delete, cache hit & miss,
+  invalidation, duplicate key, concurrent update, pagination
+- `ContentCacheTest` - cache put/get/evict, and behavior when Redis is down
+- `ContentControllerTest` - HTTP status codes and the error response shape
+- `ContentApiIntegrationTest` - full end-to-end tests against real PostgreSQL
+  and Redis (Testcontainers), including a 10-thread concurrent update race
 
-## Configuration
+The integration tests skip themselves automatically if Docker is not
+running, so `mvn test` passes anywhere and runs them fully in CI.
 
-Environment variables (see `application.yml` for defaults):
+### Test scripts
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DB_URL` | `jdbc:postgresql://localhost:5432/cms` | JDBC URL |
-| `DB_USERNAME` / `DB_PASSWORD` | `cms` / `cms` | Database credentials |
-| `DB_POOL_SIZE` | `20` | HikariCP maximum pool size |
-| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis connection |
-| `SERVER_PORT` | `8080` | HTTP port |
+```bash
+# 10 parallel PUTs with the same version - exactly one should succeed,
+# the rest get 409
+bash scripts/test-concurrent-update.sh http://localhost:8080
+
+# ~170 requests/sec (~10k/min) against the cached read endpoint for 2 min,
+# using k6 in Docker
+bash scripts/load-test-10k-per-min.sh 1
+```
+
+While the load test runs, open `docker stats` in another terminal. If
+PostgreSQL stays near idle while the app serves thousands of requests,
+the cache is doing its job.
+
+### Checking the cache by hand
+
+```bash
+# see every command the app sends to Redis
+docker exec -it content-management-service-redis-1 redis-cli monitor
+
+# look at a cached entry and its TTL (600-720s = 10min + jitter)
+docker exec -it content-management-service-redis-1 redis-cli GET cms:content:1
+docker exec -it content-management-service-redis-1 redis-cli TTL cms:content:1
+
+# overall hit/miss counters
+docker exec -it content-management-service-redis-1 redis-cli INFO stats | grep keyspace
+```
+On a cache hit you should see `CACHE HIT` in the logs and no SQL query.
